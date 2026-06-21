@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AO3 Bilingual Translator (DeepSeek)
 // @namespace    https://github.com/ao3-bilingual
-// @version      1.2.0
+// @version      1.1.2
 // @description  使用 DeepSeek LLM 自动翻译 AO3 作品，段落交替双语对照显示
 // @author       Reasonix
 // @match        https://archiveofourown.org/works/*
@@ -26,9 +26,11 @@
 
   // ==================== 状态 ====================
   let isTranslating = false;
-  let hasTranslated = false;        // 当前页面是否已完成过翻译
-  let translationsVisible = false;  // 翻译段落当前是否可见
-  let translationData = [];         // 存储翻译结果，用于 toggle
+  let isPaused = false;            // 翻译是否已暂停
+  let pauseResolve = null;         // 暂停 Promise 的 resolve，用于恢复
+  let hasTranslated = false;       // 当前页面是否已完成过翻译
+  let translationsVisible = false; // 翻译段落当前是否可见
+  let translationData = [];        // 存储翻译结果，用于 toggle
 
   // ==================== 样式注入 ====================
   GM_addStyle(`
@@ -63,6 +65,10 @@
     #ao3-translate-btn.translating {
       background: #e94560;
       animation: ao3-pulse .8s infinite alternate;
+    }
+    #ao3-translate-btn.paused {
+      background: #f0a500;
+      animation: none;
     }
     @keyframes ao3-pulse {
       from { box-shadow: 0 4px 16px rgba(233,69,96,.4); }
@@ -299,9 +305,9 @@
           <option value="deepseek-chat">deepseek-chat（V3，旧）</option>
           <option value="deepseek-reasoner">deepseek-reasoner（R1，旧）</option>
         </select>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:14px;">
-          <input id="ao3-thinking-input" type="checkbox" style="width:auto;margin:0;" />
-          <span>启用思考模式（关闭以提升翻译速度）</span>
+        <label style="display:flex !important;align-items:center;gap:8px;cursor:pointer;margin-bottom:14px !important;font-weight:600 !important;color:#555 !important;font-size:13px !important;">
+          <input id="ao3-thinking-input" type="checkbox" style="width:auto !important;margin:0 !important;accent-color:#e94560;" />
+          <span>🧠 启用思考模式（关闭以提升翻译速度）</span>
         </label>
         <div class="ao3-settings-btns">
           <button class="btn-ghost" id="ao3-settings-clear">清除记录</button>
@@ -695,6 +701,13 @@
     );
 
     for (let i = 0; i < total; i++) {
+      // ---- 暂停检查 ----
+      if (isPaused) {
+        console.log('[AO3 Translator] ⏸ 翻译已暂停（' + i + '/' + total + ' 已完成）');
+        await new Promise(resolve => { pauseResolve = resolve; });
+        console.log('[AO3 Translator] ▶ 翻译继续');
+      }
+
       const chunk = [allParagraphs[i]];
 
       // 确定前后文窗口
@@ -790,30 +803,55 @@
 
   // ==================== 主流程 ====================
   async function onTranslateClick() {
-    if (isTranslating) {
-      showToast('⏳ 翻译进行中，请稍候...');
+    const btn = document.getElementById('ao3-translate-btn');
+
+    // ---- 状态 1: 翻译中 → 暂停 ----
+    if (isTranslating && !isPaused) {
+      isPaused = true;
+      if (btn) {
+        btn.classList.remove('translating');
+        btn.classList.add('paused');
+        btn.innerHTML = '⏸';
+        btn.title = '点击继续翻译';
+      }
+      showToast('⏸ 翻译已暂停，点击按钮继续');
       return;
     }
 
-    // 如果已经翻译过，切换显示/隐藏
+    // ---- 状态 2: 已暂停 → 继续 ----
+    if (isTranslating && isPaused) {
+      isPaused = false;
+      if (btn) {
+        btn.classList.remove('paused');
+        btn.classList.add('translating');
+        btn.innerHTML = '⏳';
+        btn.title = '点击暂停翻译';
+      }
+      showToast('▶ 继续翻译...');
+      if (pauseResolve) {
+        pauseResolve();
+        pauseResolve = null;
+      }
+      return;
+    }
+
+    // ---- 状态 3: 翻译完成，切换显示/隐藏 ----
     if (hasTranslated) {
       if (translationsVisible) {
         removeTranslations();
         translationsVisible = false;
-        const btn = document.getElementById('ao3-translate-btn');
         if (btn) btn.innerHTML = '🌐';
         showToast('翻译已隐藏，再次点击显示');
       } else {
         insertTranslations(translationData);
         translationsVisible = true;
-        const btn = document.getElementById('ao3-translate-btn');
         if (btn) btn.innerHTML = '👁';
         showToast('翻译已显示');
       }
       return;
     }
 
-    // 首次翻译
+    // ---- 状态 4: 首次翻译 ----
     const paragraphs = getParagraphs();
     if (paragraphs.length === 0) {
       showToast('⚠️ 未找到可翻译的段落内容', true);
@@ -821,10 +859,11 @@
     }
 
     isTranslating = true;
-    const btn = document.getElementById('ao3-translate-btn');
+    isPaused = false;
     if (btn) {
       btn.classList.add('translating');
       btn.innerHTML = '⏳';
+      btn.title = '点击暂停翻译';
     }
 
     setProgress(0);
@@ -832,11 +871,10 @@
 
     try {
       translationData = await translateAllIncremental(paragraphs, (info) => {
-        // 每批翻译完成后更新进度
         setProgress(Math.round((info.doneParagraphs / info.totalParagraphs) * 100));
         if (info.error) {
           showToast(`⚠️ 第 ${info.batchIndex + 1}/${info.totalBatches} 批出错: ${info.error}`, true);
-        } else {
+        } else if (!isPaused) {
           showToast(`📝 已翻译 ${info.doneParagraphs}/${info.totalParagraphs} 段`);
         }
       });
@@ -845,21 +883,23 @@
       translationsVisible = true;
 
       if (btn) {
-        btn.classList.remove('translating');
+        btn.classList.remove('translating', 'paused');
         btn.innerHTML = '👁';
+        btn.title = '点击切换原文/译文';
       }
       setProgress(100);
       hideProgress();
       showToast(`✅ 翻译完成！共 ${translationData.length} 段`);
     } catch (err) {
       if (btn) {
-        btn.classList.remove('translating');
+        btn.classList.remove('translating', 'paused');
         btn.innerHTML = '🌐';
       }
       hideProgress();
       showToast('❌ ' + err.message, true);
     } finally {
       isTranslating = false;
+      isPaused = false;
     }
   }
 
