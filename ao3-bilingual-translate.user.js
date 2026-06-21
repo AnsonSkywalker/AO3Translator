@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AO3 Bilingual Translator (DeepSeek)
 // @namespace    https://github.com/ao3-bilingual
-// @version      1.1.0
+// @version      1.2.0
 // @description  使用 DeepSeek LLM 自动翻译 AO3 作品，段落交替双语对照显示
 // @author       Reasonix
 // @match        https://archiveofourown.org/works/*
@@ -234,6 +234,15 @@
     GM_setValue('ao3_deepseek_model', model);
   }
 
+  function getThinkingEnabled() {
+    // 默认 false（关闭思考模式，提速）
+    return GM_getValue('ao3_thinking_enabled', false);
+  }
+
+  function setThinkingEnabled(enabled) {
+    GM_setValue('ao3_thinking_enabled', enabled);
+  }
+
   // ==================== Toast ====================
   let toastTimer;
 
@@ -290,6 +299,10 @@
           <option value="deepseek-chat">deepseek-chat（V3，旧）</option>
           <option value="deepseek-reasoner">deepseek-reasoner（R1，旧）</option>
         </select>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:14px;">
+          <input id="ao3-thinking-input" type="checkbox" style="width:auto;margin:0;" />
+          <span>启用思考模式（关闭以提升翻译速度）</span>
+        </label>
         <div class="ao3-settings-btns">
           <button class="btn-ghost" id="ao3-settings-clear">清除记录</button>
           <button class="btn-ghost" id="ao3-settings-test">测试连接</button>
@@ -303,8 +316,10 @@
     document.getElementById('ao3-settings-save').addEventListener('click', () => {
       const key = document.getElementById('ao3-apikey-input').value.trim();
       const model = document.getElementById('ao3-model-input').value;
+      const thinking = document.getElementById('ao3-thinking-input').checked;
       if (key) setApiKey(key);
       setModel(model);
+      setThinkingEnabled(thinking);
       overlay.classList.remove('open');
       showToast('✅ 设置已保存');
     });
@@ -312,8 +327,10 @@
     document.getElementById('ao3-settings-clear').addEventListener('click', () => {
       GM_deleteValue('ao3_deepseek_key');
       GM_deleteValue('ao3_deepseek_model');
+      GM_deleteValue('ao3_thinking_enabled');
       document.getElementById('ao3-apikey-input').value = '';
       document.getElementById('ao3-model-input').value = DEFAULT_MODEL;
+      document.getElementById('ao3-thinking-input').checked = false;
       overlay.classList.remove('open');
       showToast('🗑️ 设置已清除');
     });
@@ -387,6 +404,7 @@
     ensureSettingsOverlay();
     document.getElementById('ao3-apikey-input').value = getApiKey();
     document.getElementById('ao3-model-input').value = getModel();
+    document.getElementById('ao3-thinking-input').checked = getThinkingEnabled();
     document.getElementById('ao3-settings-overlay').classList.add('open');
   }
 
@@ -569,6 +587,24 @@
 
       const { systemPrompt, userText } = buildTranslationPrompt(paragraphs, contextBefore, contextAfter);
       const tStart = performance.now();
+      const model = getModel();
+      const thinking = getThinkingEnabled();
+
+      // 构建请求体
+      const reqBody = {
+        model: model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userText },
+        ],
+        temperature: 0.3,
+        max_tokens: 8192,
+      };
+
+      // deepseek-v4 系列支持思考模式开关，默认关闭以提速
+      if (model.startsWith('deepseek-v4')) {
+        reqBody.thinking = { type: thinking ? 'enabled' : 'disabled' };
+      }
 
       GM_xmlhttpRequest({
         method: 'POST',
@@ -577,15 +613,7 @@
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + apiKey,
         },
-        data: JSON.stringify({
-          model: getModel(),
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userText },
-          ],
-          temperature: 0.3,
-          max_tokens: 8192,
-        }),
+        data: JSON.stringify(reqBody),
         timeout: 120000,
         onload: function (resp) {
           const elapsed = (performance.now() - tStart).toFixed(0);
@@ -659,6 +687,7 @@
       '══════════════════════════════════════\n' +
       '[AO3 Translator] 开始翻译\n' +
       '  模型:    ' + model + '\n' +
+      '  思考:    ' + (getThinkingEnabled() ? '开启' : '关闭') + '\n' +
       '  总段数:  ' + total + '\n' +
       '  批次:    ' + BATCH_SIZE + ' 段/次\n' +
       '  前文:    ' + CONTEXT_BEFORE + ' 段  后文: ' + CONTEXT_AFTER + ' 段\n' +
