@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AO3 Bilingual Translator (DeepSeek)
 // @namespace    https://github.com/ao3-bilingual
-// @version      1.0.1
+// @version      1.1.0
 // @description  使用 DeepSeek LLM 自动翻译 AO3 作品，段落交替双语对照显示
 // @author       Reasonix
 // @match        https://archiveofourown.org/works/*
@@ -18,7 +18,7 @@
 
   // ==================== 常量 ====================
   const API_URL = 'https://api.deepseek.com/chat/completions';
-  const DEFAULT_MODEL = 'deepseek-chat';
+  const DEFAULT_MODEL = 'deepseek-v4-flash';
   const PARA_DELIMITER = '\n\n<<<AO3_PARA_BREAK>>>\n\n';
   const BATCH_SIZE = 1;          // 每批 1 段（逐段调 API，无需拆分，100% 可靠）
   const CONTEXT_BEFORE = 2;      // 前文段落数（上下文窗口）
@@ -285,10 +285,10 @@
         <input id="ao3-apikey-input" type="password" placeholder="sk-..." />
         <label for="ao3-model-input">模型</label>
         <select id="ao3-model-input">
-          <option value="deepseek-chat">deepseek-chat (V3)</option>
-          <option value="deepseek-reasoner">deepseek-reasoner (R1)</option>
-          <option value="deepseek-v4-flash">deepseek-v4-flash (新)</option>
-          <option value="deepseek-v4-pro">deepseek-v4-pro (新)</option>
+          <option value="deepseek-v4-flash">deepseek-v4-flash（快速，推荐）</option>
+          <option value="deepseek-v4-pro">deepseek-v4-pro（高质量）</option>
+          <option value="deepseek-chat">deepseek-chat（V3，旧）</option>
+          <option value="deepseek-reasoner">deepseek-reasoner（R1，旧）</option>
         </select>
         <div class="ao3-settings-btns">
           <button class="btn-ghost" id="ao3-settings-clear">清除记录</button>
@@ -568,10 +568,7 @@
       }
 
       const { systemPrompt, userText } = buildTranslationPrompt(paragraphs, contextBefore, contextAfter);
-
-      console.log('[AO3 Translator] 发送翻译请求，段落数:', paragraphs.length,
-        '前文:', (contextBefore || []).length, '段 后文:', (contextAfter || []).length, '段',
-        '字符数:', userText.length);
+      const tStart = performance.now();
 
       GM_xmlhttpRequest({
         method: 'POST',
@@ -591,7 +588,7 @@
         }),
         timeout: 120000,
         onload: function (resp) {
-          console.log('[AO3 Translator] 收到响应，status:', resp.status);
+          const elapsed = (performance.now() - tStart).toFixed(0);
 
           if (resp.status < 200 || resp.status >= 300) {
             let detail = resp.responseText || '';
@@ -600,6 +597,7 @@
               detail = errData.error?.message || errData.message || detail;
             } catch (_) {}
             if (detail.length > 300) detail = detail.slice(0, 300) + '…';
+            console.warn('[AO3 Translator] ✗ HTTP', resp.status, '|', elapsed + 'ms');
             reject(new Error(`API 返回错误 (HTTP ${resp.status}): ${detail}`));
             return;
           }
@@ -607,25 +605,31 @@
           try {
             const data = JSON.parse(resp.responseText);
             if (data.error) {
+              console.warn('[AO3 Translator] ✗ API error |', elapsed + 'ms');
               reject(new Error('API 错误: ' + (data.error.message || JSON.stringify(data.error))));
               return;
             }
             const translatedText = data.choices?.[0]?.message?.content?.trim();
             if (!translatedText) {
-              console.warn('[AO3 Translator] API 返回为空');
+              console.warn('[AO3 Translator] ✗ 空响应 |', elapsed + 'ms');
               reject(new Error('API 返回为空，请检查 API Key 是否有效'));
               return;
             }
-            // BATCH_SIZE=1：每段独立调用，响应直接就是这一段译文，无需拆分
             const translatedParas = [translatedText];
-            console.log('[AO3 Translator] 翻译成功');
+            const tokensUsed = data.usage?.total_tokens || '?';
+            console.log('[AO3 Translator] ✓', elapsed + 'ms',
+              '| 入', userText.length, '字 → 出', translatedText.length, '字',
+              '| tokens:', tokensUsed);
             resolve(translatedParas);
           } catch (e) {
+            console.warn('[AO3 Translator] ✗ 解析失败 |', elapsed + 'ms');
             reject(new Error('解析 API 返回失败: ' + e.message));
           }
         },
         onerror: function (resp) {
-          console.error('[AO3 Translator] 请求失败，完整响应:', JSON.stringify(resp, null, 2));
+          const elapsed = (performance.now() - tStart).toFixed(0);
+          console.error('[AO3 Translator] ✗ 网络错误 |', elapsed + 'ms',
+            '|', resp ? ('HTTP ' + (resp.status || '?') + ' ' + (resp.statusText || '')) : '');
           let detail = '';
           if (resp) {
             detail = `HTTP ${resp.status || '?'} ${resp.statusText || ''}`;
@@ -637,6 +641,8 @@
           reject(new Error('网络请求失败' + (detail ? ': ' + detail : '，请检查网络连接或防火墙设置')));
         },
         ontimeout: function () {
+          const elapsed = (performance.now() - tStart).toFixed(0);
+          console.warn('[AO3 Translator] ✗ 超时 |', elapsed + 'ms');
           reject(new Error('请求超时（120秒），请检查网络或稍后重试'));
         },
       });
@@ -646,9 +652,21 @@
   async function translateAllIncremental(allParagraphs, onBatchDone) {
     const total = allParagraphs.length;
     const allResults = [];
+    const tOverall = performance.now();
+    const model = getModel();
+
+    console.log(
+      '══════════════════════════════════════\n' +
+      '[AO3 Translator] 开始翻译\n' +
+      '  模型:    ' + model + '\n' +
+      '  总段数:  ' + total + '\n' +
+      '  批次:    ' + BATCH_SIZE + ' 段/次\n' +
+      '  前文:    ' + CONTEXT_BEFORE + ' 段  后文: ' + CONTEXT_AFTER + ' 段\n' +
+      '══════════════════════════════════════'
+    );
 
     for (let i = 0; i < total; i++) {
-      const chunk = [allParagraphs[i]]; // BATCH_SIZE=1，每批 1 段
+      const chunk = [allParagraphs[i]];
 
       // 确定前后文窗口
       const beforeStart = Math.max(0, i - CONTEXT_BEFORE);
@@ -673,7 +691,6 @@
           allResults.push(item);
         }
 
-        // 即时渲染
         insertTranslations(batchResults);
 
         if (onBatchDone) {
@@ -706,6 +723,17 @@
         }
       }
     }
+
+    const totalSec = ((performance.now() - tOverall) / 1000).toFixed(1);
+    const avgSec = ((performance.now() - tOverall) / total / 1000).toFixed(1);
+    console.log(
+      '══════════════════════════════════════\n' +
+      '[AO3 Translator] 翻译完成\n' +
+      '  总耗时:  ' + totalSec + 's\n' +
+      '  平均:    ' + avgSec + 's/段\n' +
+      '  成功:    ' + allResults.filter(r => !r.translation.startsWith('[翻译失败')).length + '/' + total + '\n' +
+      '══════════════════════════════════════'
+    );
 
     return allResults;
   }
